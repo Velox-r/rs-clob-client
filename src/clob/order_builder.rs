@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use rand::RngExt as _;
+use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive as _;
 
 use crate::Result;
@@ -154,8 +155,6 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             .minimum_tick_size
             .as_decimal();
 
-        let decimals = minimum_tick_size.scale();
-
         if price.scale() > minimum_tick_size.scale() {
             return Err(Error::validation(format!(
                 "Unable to build Order: Price {price} has {} decimal places. Minimum tick size \
@@ -217,13 +216,24 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         // e.g. User submits a limit order to buy 100 `YES` tokens at $0.34.
         // This means they will take/receive 100 `YES` tokens, make/give up 34 USDC. This means that
         // the `taker_amount` is `100000000` and the `maker_amount` of `34000000`.
+        // BUY: ceil USDC cost to LOT_SIZE_SCALE (2dp) — overpays by at most 0.01 USDC,
+        // ensuring effective_price >= ask so the FOK fills.
+        // SELL: trunc USDC proceeds to LOT_SIZE_SCALE (2dp) — receives at most 0.01 less,
+        // ensuring effective_price >= bid so the FOK fills.
+        //
+        // The CLOB API requires maker_amount to have at most LOT_SIZE_SCALE decimal places.
+        // The previous `decimals + LOT_SIZE_SCALE` computation produced 4dp for 0.01-tick
+        // markets (decimals=2), which the API rejects.
         let (taker_amount, maker_amount) = match side {
             Side::Buy => (
                 size,
-                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+                (size * price).round_dp_with_strategy(
+                    LOT_SIZE_SCALE,
+                    RoundingStrategy::ToPositiveInfinity,
+                ),
             ),
             Side::Sell => (
-                (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
+                (size * price).trunc_with_scale(LOT_SIZE_SCALE),
                 size,
             ),
             side => return Err(Error::validation(format!("Invalid side: {side}"))),
@@ -416,19 +426,22 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         let (taker_amount, maker_amount) = match (side, amount.0) {
             // Spend USDC to buy shares
             (Side::Buy, AmountInner::Usdc(_)) => {
-                let shares = (raw_amount / price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+                let shares = (raw_amount / price).trunc_with_scale(LOT_SIZE_SCALE);
                 (shares, raw_amount)
             }
 
             // Buy N shares: use cutoff `price` derived from ask depth
             (Side::Buy, AmountInner::Shares(_)) => {
-                let usdc = (raw_amount * price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+                let usdc = (raw_amount * price).round_dp_with_strategy(
+                    LOT_SIZE_SCALE,
+                    RoundingStrategy::ToPositiveInfinity,
+                );
                 (raw_amount, usdc)
             }
 
             // Sell N shares for USDC
             (Side::Sell, AmountInner::Shares(_)) => {
-                let usdc = (raw_amount * price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+                let usdc = (raw_amount * price).trunc_with_scale(LOT_SIZE_SCALE);
                 (usdc, raw_amount)
             }
 
@@ -534,5 +547,44 @@ mod tests {
         let masked_salt = to_ieee_754_int(raw_salt);
 
         assert!(masked_salt < (1 << 53));
+    }
+
+    /// Verifies that maker/taker amounts are rounded to at most LOT_SIZE_SCALE (2dp),
+    /// not `decimals + LOT_SIZE_SCALE` (4dp for 0.01-tick markets).
+    #[test]
+    fn amount_precision_max_2dp() {
+        // BUY: 5.95 shares at 0.84 → 4.998 USDC → ceil to 5.00 (2dp)
+        let buy_maker = (dec!(5.95) * dec!(0.84)).round_dp_with_strategy(
+            LOT_SIZE_SCALE,
+            RoundingStrategy::ToPositiveInfinity,
+        );
+        assert_eq!(buy_maker, dec!(5.00));
+        assert!(buy_maker.scale() <= LOT_SIZE_SCALE);
+        // Effective price 5.00/5.95 = 0.8403 > 0.84 ✓ (fills against ask)
+        assert!(buy_maker / dec!(5.95) > dec!(0.84));
+        // Fixed-point: 5.00 * 10^6 = 5_000_000, divisible by 10_000
+        assert_eq!(to_fixed_u128(buy_maker) % 10_000, 0);
+
+        // SELL: 5.95 shares at 0.84 → 4.998 USDC → trunc to 4.99 (2dp)
+        let sell_taker = (dec!(5.95) * dec!(0.84)).trunc_with_scale(LOT_SIZE_SCALE);
+        assert_eq!(sell_taker, dec!(4.99));
+        assert!(sell_taker.scale() <= LOT_SIZE_SCALE);
+        // Fixed-point: 4.99 * 10^6 = 4_990_000, divisible by 10_000
+        assert_eq!(to_fixed_u128(sell_taker) % 10_000, 0);
+
+        // Edge case: exact 2dp product should pass through unchanged
+        let exact = (dec!(10.00) * dec!(0.50)).round_dp_with_strategy(
+            LOT_SIZE_SCALE,
+            RoundingStrategy::ToPositiveInfinity,
+        );
+        assert_eq!(exact, dec!(5.00));
+
+        // Edge case: 0.01-tick market with small fractional overshoot
+        // 7.00 * 0.73 = 5.11 (exact 2dp) → no rounding needed
+        let no_round = (dec!(7.00) * dec!(0.73)).round_dp_with_strategy(
+            LOT_SIZE_SCALE,
+            RoundingStrategy::ToPositiveInfinity,
+        );
+        assert_eq!(no_round, dec!(5.11));
     }
 }
