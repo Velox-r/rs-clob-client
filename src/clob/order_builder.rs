@@ -217,9 +217,9 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         // This means they will take/receive 100 `YES` tokens, make/give up 34 USDC. This means that
         // the `taker_amount` is `100000000` and the `maker_amount` of `34000000`.
         // BUY: ceil USDC cost to LOT_SIZE_SCALE (2dp) — overpays by at most 0.01 USDC,
-        // ensuring effective_price >= ask so the FOK fills.
+        // ensuring effective_price (maker/taker) >= ask so the FOK fills.
         // SELL: trunc USDC proceeds to LOT_SIZE_SCALE (2dp) — receives at most 0.01 less,
-        // ensuring effective_price >= bid so the FOK fills.
+        // ensuring effective_price (taker/maker) <= bid so the FOK fills.
         //
         // The CLOB API requires maker_amount to have at most LOT_SIZE_SCALE decimal places.
         // The previous `decimals + LOT_SIZE_SCALE` computation produced 4dp for 0.01-tick
